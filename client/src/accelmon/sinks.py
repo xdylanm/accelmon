@@ -5,6 +5,8 @@ import numpy as np
 from scipy.signal import get_window
 import threading
 import time
+import datetime
+from datetime import timezone
 
 class SampleSink:
     """The abstract base class for sinks to record streaming sample data"""
@@ -47,7 +49,12 @@ class CsvSampleSink (SampleSink):
 
     def write(self, sample):
         for s in sample:
-            self.hf.write("{}\n".format(s))
+            #if this is too much, could run a modulo on # of samples and insert only after X samples?
+            dt = datetime.datetime.now(timezone.utc)
+            utc_time = dt.replace(timezone.utc)
+            utc_timestamp = utc_time.timestamp()
+
+            self.hf.write("{} {}\n".format(s, utc_timestamp))
         self.n_samples += len(sample)
 
     def sample_count(self):
