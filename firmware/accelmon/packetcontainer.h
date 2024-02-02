@@ -1,62 +1,64 @@
 #ifndef packet_container_h_
 #define packet_container_h_
 
+#define HDR_TYPE_DATA 0x40      // MSB is zero
+#define HDR_TYPE_RESP 0x80
+#define HDR_TYPE_HALT 0xC0
 
-#define HDR_TYPE_DATA 0x1
-#define HDR_TYPE_RESP 0x2
-#define HDR_TYPE_HALT 0x3
+#define RESP_TYPE_NONE          0x00
+#define RESP_TYPE_ID            0x01
+#define RESP_TYPE_SAMPLE_COUNT  0x02
+#define RESP_TYPE_DROPPED_COUNT 0x03
+#define RESP_TYPE_T_MEAN        0x04
+#define RESP_TYPE_T_VARIANCE    0x05
+#define RESP_TYPE_T_MAX         0x06
+#define RESP_TYPE_T_MIN         0x07
+#define RESP_TYPE_T_N           0x08
 
-#define RESP_TYPE_RSVD      0x0
-#define RESP_TYPE_ID        0x1
-#define RESP_TYPE_FCLK      0x2
-#define RESP_TYPE_DIV       0x3
-#define RESP_TYPE_DIV_MODE  0x4
-#define RESP_TYPE_ADC_PRE   0x5
-#define RESP_TYPE_SAMPLE_COUNT  0x6
-#define RESP_TYPE_ADC_SAMPLEN   0x7
 
-#define MAX_PACKET_LENGTH 64
+#define MAX_PACKET_LENGTH_BYTES 242   // 2-byte header + 120 words   
 
 class PacketContainer 
 {
 public:
   
- PacketContainer() : max_packets(0), sample_count(0), pos(1) {}
+  PacketContainer() : max_packets(0), sample_count(0), pos(1) {}
 
   uint32_t max_packets;
   uint32_t sample_count;
   uint8_t const* buffer() const { return &buf[0]; }
 
-  int8_t write_resp(uint8_t resp_type, uint32_t val)
+  template<typename T>
+  int8_t write_resp(uint8_t resp_type, T val)
   {
-    buf[0] = (HDR_TYPE_RESP << 6) | (resp_type << 3);
+    buf[0] = HDR_TYPE_RESP | resp_type;
     write_to_buf(val, &buf[1]);
     return 5;
   }
   int8_t write_halt() 
   {
-    buf[0] = HDR_TYPE_HALT << 6;
+    buf[0] = HDR_TYPE_HALT;
     write_to_buf(sample_count, &buf[1]);
     return 5;
   }
+
   bool append_sample(uint16_t data) 
   {
-    write_to_buf(data, &buf[pos]);
-    sample_count++;
-    pos += 2;   // sizeof(uint16_t)
-    if (pos >= (MAX_PACKET_LENGTH-2)) { 
-      buf[0] = (HDR_TYPE_DATA << 6) | pos;
-      return true;
+    write_to_buf(data, &buf[2*pos++]);
+    sample_count++;   // accumulate total samples recorded over run
+    if (pos < (MAX_PACKET_LENGTH_BYTES >> 1)) {
+      return false;
     }
-    return false;
+    uint16_t const hdr_word = (HDR_TYPE_DATA << 8) | (0x3FFF & (pos-1));  // -1 for header
+    write_to_buf(hdr_word, &buf[0]);
+    return true;
   }
-
-  uint8_t byte_count() const { return pos; }
+  uint8_t byte_count() const { return 2*pos; }
   void reset() { pos = 1; }
 
 private:
-  uint8_t pos;
-  uint8_t buf[MAX_PACKET_LENGTH];
+  uint16_t pos;   // buffer position in words (16-bit)
+  uint8_t buf[MAX_PACKET_LENGTH_BYTES];
 
   template<typename T>
   void write_to_buf(T v, uint8_t* start) 
@@ -66,8 +68,6 @@ private:
       *start++ = bvals[sizeof(T)-1-i];   // MSB first
     }
   }
-
-  
 };
 
 static PacketContainer packet;

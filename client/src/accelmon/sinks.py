@@ -5,6 +5,39 @@ import numpy as np
 from scipy.signal import get_window
 import threading
 import time
+import struct
+
+class RawValueConverter:
+    """The abstract base class to convert raw values from an ADC to physically
+    meaningful numbers for analysis"""
+    def conv(self, v, i):
+        pass
+
+class NoConversionConverter (RawValueConverter):
+    """Do nothing, return the tuple of the value and a zero flag bit"""
+    def conv(self, v, i):
+        return v, None
+
+
+class IntervalSignedInt16Converter (RawValueConverter):
+    """
+    Interpret raw values as signed int 16 and scale to float. 
+    The first column is an interval in (us) with the upper bit set if 
+    the tach signal is present.
+    """
+
+    def __init__(self, cols=4, scaling=1.):
+        self.cols = cols
+        self.a = scaling
+
+    def conv(self, v, i):
+        if i % self.cols == 0:  # first entry in row is interval (us) as uint16_t
+            tach_bit = 1 if 0x8000 & int(v) else 0
+            return (int(v) & 0x7FFF), tach_bit
+        b = int(v).to_bytes(2,'little')
+        c = struct.unpack('<h',b)[0]
+        return self.a * c, None
+
 
 class SampleSink:
     """The abstract base class for sinks to record streaming sample data"""
@@ -30,10 +63,12 @@ class SampleSink:
 class CsvSampleSink (SampleSink):
     """Write sample data to a text file in comma separated value (CSV) format"""
 
-    def __init__(self, filename):
+    def __init__(self, filename, width=1, converter=NoConversionConverter):
         self.filename = filename
         self.hf = None
+        self.width = width
         self.n_samples = 0
+        self.converter = converter
 
     def open(self): 
         self.close()
@@ -47,8 +82,15 @@ class CsvSampleSink (SampleSink):
 
     def write(self, sample):
         for s in sample:
-            self.hf.write("{}\n".format(s))
-        self.n_samples += len(sample)
+            v, b = self.converter.conv(s,self.n_samples)
+            if b is not None:
+                self.hf.write(f"{b},")
+            self.hf.write(f"{v}")
+            self.n_samples += 1
+            if self.n_samples % self.width == 0:
+                self.hf.write("\n")
+            else:
+                self.hf.write(",")
 
     def sample_count(self):
         return self.n_samples
@@ -68,27 +110,30 @@ class ListSampleSink (SampleSink):
 class NpArraySampleSink(SampleSink):
     """Write sample data to a Numpy Array"""
 
-    def __init__(self, T, scaling=1):
+    def __init__(self, T, scaling=1, width=1):
         self.timestamp = datetime.now()
         self.delta_ns = round(T*1e9)
         self.resize_count = 0
         self.resize_stride = int(1.0/T)
         self.n_resizes = 1
 
-        self.signal = np.zeros((self.resize_stride,), dtype=np.float32)
+        self.signal = np.zeros((self.resize_stride, width), dtype=np.float32)
         self.ndx = 0
         self.scaling = scaling
         self.raw_T = T
 
     def write(self, sample):
+        width = self.signal.shape[1]
         if len(sample)+self.resize_count >= self.resize_stride:
             self.n_resizes += 1
-            self.signal = np.resize(self.signal, ((self.n_resizes*self.resize_stride,)))
+            self.signal = np.resize(self.signal, ((self.n_resizes*self.resize_stride,width)))
             self.resize_count -= self.resize_stride
         self.resize_count += len(sample)
 
         for s in sample:
-            self.signal[self.ndx] = s * self.scaling
+            r = self.ndx // width
+            c = self.ndx % width
+            self.signal[r, c] = s * self.scaling
             self.ndx += 1
 
     def sample_count(self):

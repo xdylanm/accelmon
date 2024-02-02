@@ -1,146 +1,292 @@
-// testing the free-running ADC on the Trinket M0
-// https://forcetronic.blogspot.com/2016/10/utilizing-advanced-adc-capabilities-on.html
-// https://community.atmel.com/forum/samd21-adc-interrupt-routine
-// https://www.eevblog.com/forum/microcontrollers/pin-multiplexing-in-samd21/
-// https://github.com/ataradov/mcu-starter-projects/blob/master/samd21/hal_gpio.h
-// https://forum.arduino.cc/t/arduino-m0-pro-adc-free-running-with-interrupt/471688
-
 #include <Adafruit_NeoPixel.h>
-
-#include "adc_util.h"
-#include "gclk_util.h"
-#include "port_util.h"
+#include <RingBuf.h>
+#include <FlashStorage.h>
 #include "packetcontainer.h"
+#include "ADXL1005.h"
+#include "KX134.h"
 
-// IO Pins from SAMD
-#define SELF_TEST_IOPIN 16  // D4/SDA
-#define STBY_IOPIN 17       // D5/SCL
-#define OR_IOPIN 6          // D6/A6/TX
-#define ADC_CONV_IOPIN 7    // D7/A7/RX
+#define BOARD_ID_MASK 0x00FFFFFF
 
-void process_serial_buffer();
-
-struct RunConfig
-{
-  RunConfig() 
-    : started(false), clk_div(240), 
-      clk_divsel(GCLK_DIVSEL_DIRECT), 
-      adc_prescaler(0),
-      adc_samplen(0),
-      fclk(48000000)
-  {
-    
-  }
-  
-  uint32_t adc_clk_est() const {
-    return fclk >> (adc_prescaler + 2);
-  }
-
-  bool started;
-  uint8_t clk_div;
-  DIVSEL_T clk_divsel;
-  uint8_t adc_prescaler;
-  uint8_t adc_samplen;
-  uint32_t fclk;
-} cfg;
-
-// create a pixel strand with 1 pixel on PIN_NEOPIXEL
-Adafruit_NeoPixel pixels(1, PIN_NEOPIXEL);
-
-volatile bool result_ready;
-volatile uint16_t adc_val;
+volatile bool data_ready;
 volatile uint32_t dropped_count;
-volatile uint32_t timestamp_us;
+volatile uint32_t timestamp_curr;
+volatile uint32_t timestamp_prev;
+volatile bool tach_edge;
+volatile bool tach_state; 
+
+RingBuf<uint16_t, 512> adc_val;
+
+bool is_running;
+uint8_t tach_blink_counter;
+
+typedef struct {
+  int16_t  skip_count;
+  uint32_t n;    // count
+  float    mu;   // mean
+  float    M2;   // sum of squares diff from mean 
+  uint32_t max_T;
+  uint32_t min_T;
+  void update(uint32_t new_interval_n)
+  {
+    float const new_interval = (float)new_interval_n;
+
+    // Welfords algorithm https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
+    if (skip_count == 0) {
+      n++;
+      float const delta = new_interval - mu;
+      mu += delta / (float)n;
+      M2 += delta * (new_interval - mu );  // use updated mu for "delta2"
+      if (new_interval_n > max_T) {
+        max_T = new_interval_n;
+      } else if (new_interval_n < min_T) {
+        min_T = new_interval_n;
+      }
+    } else {
+      skip_count--;
+      if (skip_count == 0) {
+        mu = new_interval;
+        n = 1;
+      }
+    }
+  }
+  void reset(int16_t const skips=2) 
+  {
+    skip_count = skips;
+    max_T = 0;
+    min_T = UINT32_MAX;
+    M2 = 0.0;
+    mu = 0.0;
+    n = 0;
+  }
+} timing_statistics_t;
+timing_statistics_t timing_stats;
+
+
+uint32_t serial_read_uint32();
+void process_serial_buffer();
+void halt_and_blink_until_reset(int8_t r, int8_t g, int8_t b);
+void reset_for_data_collection();
 
 void ADC_Handler() 
 {
-  PORT->Group[PORTA].OUTTGL.reg = (1 << ADC_CONV_IOPIN); 
-  if (!result_ready) {
-    //timestamp_us = TC4->COUNT32.COUNT.reg;
-    adc_val = 0x0FFF & ADC->RESULT.reg;     // uint16_t
-    result_ready = true;
-  } else {
+  timestamp_curr = micros();
+  PORT->Group[PORTA].OUTTGL.reg = (1 << ADXL1005_ADC_CONV_IOPIN); 
+  if (!adc_val.push(0x0FFF & ADC->RESULT.reg)) {
     dropped_count++;
   }
   ADC->INTFLAG.bit.RESRDY = 1;  // write a bit to clear interrupt
 }
 
+// uses the Arduino implementation for the EIC, which handles clearing the flag (see WInterrupts.c)
+void data_ready_ISR()
+{
+  timestamp_prev = timestamp_curr;
+  timestamp_curr = micros();
+  
+  if (data_ready) { // not cleared
+    dropped_count++;
+  }
+  tach_state = digitalRead(TACH_OPEN_COLLECTOR_PIN);
+  data_ready = true;
+}
+
+void tach_edge_ISR() 
+{
+  tach_edge = true;
+}
+
+// create a pixel strand with 1 pixel on PIN_NEOPIXEL
+Adafruit_NeoPixel pixels(1, PIN_NEOPIXEL);
+
+// create an accelerometer
+//ADXL1005 accel;
+KX134 accel(data_ready_ISR, KX134_DRDY_ARDUINO_PIN);
+
+FlashStorage(board_id_store, uint32_t);
+uint32_t board_id;
+
+
 void setup() 
 {
-  Serial.begin(115200);
+  is_running = false;
+  data_ready = false;
+  tach_edge = false;
+  tach_blink_counter = 0;
+  pinMode(TACH_OPEN_COLLECTOR_PIN, INPUT_PULLUP);
+  pinMode(TACH_INDICATOR_LED_PIN, OUTPUT);
+  digitalWrite(TACH_INDICATOR_LED_PIN, 0);
+
+  board_id = BOARD_ID_MASK & board_id_store.read();  // upper byte reserved for board type
+
+  Serial.begin(921600);
   pixels.begin();
   
   delay(1000);
 
   pixels.setPixelColor(0, pixels.Color(0, 96, 0));
   pixels.show();
-    
-  init_pin_for_D_out(ADC_CONV_IOPIN);
-  init_pin_for_D_out(STBY_IOPIN);
-  init_pin_for_D_out(SELF_TEST_IOPIN);
-  init_pin_for_D_in(OR_IOPIN);
-  
-  //Serial.println("Hello accelo");
 
-  init_pin_for_CLK_out();
-  cfg.fclk = init_GCLK(5, cfg.clk_div, cfg.clk_divsel, true);  
+  delay(1000);
 
-  init_pin_for_ADC_in();
-  init_ADC(GCLK_CLKCTRL_GEN_GCLK5);
-
-  //Serial.print("fclk = ");
-  //Serial.println(cfg.fclk);
+  if (!accel.init()) {
+    pixels.setPixelColor(0, pixels.Color(96, 0, 0));
+    pixels.show();
+    while(1); // wait forever
+  }
 
   delay(1000);
   pixels.clear();
   pixels.show();
-  
+
 
 }
 
+
 void loop() 
 {
-  process_serial_buffer();
+  if (Serial.available() > 0) {
+    process_serial_buffer();
+  }
 
-  if (result_ready) {
-    uint16_t const sample = adc_val;
-    result_ready = false;
+  // for digitial read (I2C or SPI) from KX134 
+  // could probably write direct to packet here
+  if (is_running && data_ready) {
+    uint16_t const tach_bit = tach_state ? 0x8000 : 0;
+    //uint16_t const tach_bit = tach_edge ? 0x8000 : 0;
+    tach_edge = false;  // reset it 
+
+    auto const data = accel.process();  // 16us
+    uint32_t const interval_us = timestamp_curr > timestamp_prev ? 
+        timestamp_curr - timestamp_prev : (0xFFFFFFFF - timestamp_prev) + timestamp_curr;
+    data_ready = false;
+
+    // assume that the minimum sample rate is > 32Hz (<32768us period)
+    //if (interval_us > 0x00007FFF) {
+    //  halt_and_blink_until_reset(64,0,0);
+    //}
+    uint16_t const interval_with_flag = (0x7FFF & interval_us) | tach_bit;
+
+    if (adc_val.push(interval_with_flag)) {
+      for (int16_t i = 0; i < data.count; ++i) {
+        if (!adc_val.push(data.buf[i])) {
+          dropped_count++;
+        }
+      }
+    } else {
+      dropped_count += data.count;
+    }
+
+    timing_stats.update(interval_us);
+  }
+
+  digitalWrite(TACH_INDICATOR_LED_PIN, digitalRead(TACH_OPEN_COLLECTOR_PIN));
+
+  uint16_t sample;
+  while (adc_val.lockedPop(sample)) {
     if (packet.append_sample(sample)) {
       Serial.write(packet.buffer(), packet.byte_count());
-      packet.reset();    
+      packet.reset();
     }        
     if ((packet.max_packets > 0) && (packet.sample_count >= packet.max_packets)) {
-      stop_ADC();
-      cfg.started = false;
+      is_running = false;
+      accel.stop();
       Serial.write(packet.buffer(), packet.byte_count());
-      packet.reset();
     }
   }
+}
+
+void halt_and_blink_until_reset(int8_t r, int8_t g, int8_t b)
+{
+  accel.stop(); // disable interrupts
+  while (1) {
+    pixels.setPixelColor(0, pixels.Color(r, g, b));
+    pixels.show();
+    delay(500);
+    if (Serial.available() > 0) {
+      char const data_in = Serial.read();
+      if (data_in == 'Z') {
+        break;
+      }
+    }
+
+    pixels.clear();
+    pixels.show();
+    delay(500);
+    if (Serial.available() > 0) {
+      char const data_in = Serial.read();
+      if (data_in == 'Z') {
+        break;
+      }
+    }
+  }
+
+  NVIC_SystemReset();
+
+}
+
+void reset_for_data_collection()
+{
+  dropped_count = 0;
+  data_ready = false;
+  packet.reset();
+  packet.sample_count = 0;
+  timing_stats.reset(2);
+  adc_val.clear();
+}
+
+int serial_read_uint32(uint32_t& val)
+{
+  uint8_t buf[4];
+  int const rlen = Serial.readBytes(reinterpret_cast<char*>(&buf[0]), 4);
+  val = *reinterpret_cast<uint32_t*>(buf);
+  return rlen;
 }
 
 // Message format
 // H : halt, send last packet then halt packet
 // R# : start with max packets count as string (0=no max), streams packets HDR_DATA | timestamp_ms | T .. | P ..
 // C : configure
+//  general
+//  B# : board ID (24 bits -- upper byte reserved for accelerometer type)
+//  KX134
+//  F# : output data rate (4-bit code, see docs)
+//  G# : g range selection 0=8g, 1=16g, 2=32g, 3=64g
+//  ADXL1005
 //  D# : clock divisor (0-255 for direct, 0-8 for pow2)
 //  M# : clock divisor mode (0=direct, 1=pow2)
 //  P# : ADC prescaler (2^(x + 4))
 //  L# : ADC sample length (half-clock cycles)
 // A : ask
+//  general
+//  B : Accelerometer type [24:31] | board ID [0:23]
+//  C : sample count
+//  X : dropped count
+//  U : mean sample time
+//  V : sample time variance
+//  R : max T
+//  S : min T
+//  N : n for mean 
+//  KX134
+//  F : output data rate (4-bit code)
+//  G : g range selection 0=8g, 1=16g, 2=32g, 3=64g
+//  ADXL1005
 //  F : ADC clock frequency
 //  D : clock divisor
 //  M : clock divisor mode (0=direct, 1 = pow2)
 //  P : ADC prescaler setting
 //  L : ADC sample length
 // Z : reset the board
+// ask/resp: A---E--HIJK--NO-QRST--W-YZ
 void process_serial_buffer()
 {
   char const data_in = Serial.read();
   if (data_in == 'Z') {
     NVIC_SystemReset();
-  } else if ((data_in == 'H') && (cfg.started)) {
-      stop_ADC();
-      cfg.started = false;
+  } else if ((data_in == 'H') && (is_running)) {
+      is_running = false;
+      accel.stop();
+      
+      //detachInterrupt(digitalPinToInterrupt(TACH_OPEN_COLLECTOR_PIN));
 
       if (dropped_count == 0) {
         pixels.clear();
@@ -149,12 +295,10 @@ void process_serial_buffer()
       }
       pixels.show();
 
-  } else if (!cfg.started) {
+  } else if (!is_running) {
     if (data_in == 'R') {
-      char count_buf[4];
-      int const rlen = Serial.readBytes(count_buf, 4);
-      if (rlen == 4) {
-        auto const cfg_val = *reinterpret_cast<uint32_t*>(count_buf);
+      uint32_t cfg_val = 0;
+      if (serial_read_uint32(cfg_val) == 4) {
         packet.max_packets = cfg_val >= 0 ? cfg_val : 0;
       } else {
         packet.max_packets = 0;
@@ -162,63 +306,47 @@ void process_serial_buffer()
 
       pixels.setPixelColor(0, pixels.Color(0, 0, 96));
       pixels.show();
-     
-      packet.sample_count = 0;
-      cfg.started = true;
-      dropped_count = 0;
-      result_ready = false;
-      start_ADC();
-    } else if (data_in == 'C') {
-      char const cfg_opt = Serial.read();      
-      bool invalidate_clk = false;
-      bool invalidate_adc = false;
-      if (cfg_opt == 'D') {
-        cfg.clk_div = Serial.parseInt();        
-        invalidate_clk = true;
-      } else if (cfg_opt == 'M') {
-        cfg.clk_divsel = Serial.parseInt() == 0 ? GCLK_DIVSEL_DIRECT : GCLK_DIVSEL_POW2;
-        invalidate_clk = true;
-      } else if (cfg_opt == 'P') {
-        uint8_t const pval = Serial.parseInt();
-        if ((pval != cfg.adc_prescaler) &&  (pval < 8)) {        
-          cfg.adc_prescaler = pval;
-          invalidate_adc = true;
-        }
-      } else if (cfg_opt == 'L') {
-        uint8_t const lval = Serial.parseInt();
-        if ((lval != cfg.adc_samplen) &&  (lval < 64)) {        
-          cfg.adc_samplen = lval;
-          invalidate_adc = true;
-        }
-      } 
 
-      if (invalidate_clk) {
-        cfg.fclk = init_GCLK(5, cfg.clk_div, cfg.clk_divsel, true);  
-      }
-      if (invalidate_adc) {
-          stop_ADC();
-          init_ADC(GCLK_CLKCTRL_GEN_GCLK5, cfg.adc_prescaler, cfg.adc_samplen);
+      //attachInterrupt(digitalPinToInterrupt(TACH_OPEN_COLLECTOR_PIN), tach_edge_ISR, FALLING);
+
+      reset_for_data_collection();
+      is_running = true;
+      accel.start();
+      timestamp_prev = micros();    // rough starting point
+    } else if (data_in == 'C') {
+      char const cfg_key = Serial.read(); 
+      uint32_t cfg_val = 0;
+      if (serial_read_uint32(cfg_val) == 4) {
+        if (cfg_key == 'B') {
+          board_id = cfg_val & BOARD_ID_MASK;
+          board_id_store.write(board_id);
+        } else {
+          accel.set(cfg_key, cfg_val);
+        }
       }
     } else if (data_in == 'A') {
       char const ask_opt = Serial.read();
       uint8_t count = 0;
-      if (ask_opt == 'F') {
-        //Serial.println(cfg.fclk);        
-        count = packet.write_resp(RESP_TYPE_FCLK, cfg.adc_clk_est());        
-      } else if (ask_opt == 'D') {
-        //Serial.println(cfg.clk_div);
-        count = packet.write_resp(RESP_TYPE_DIV, cfg.clk_div);        
-      } else if (ask_opt == 'M') {
-        //Serial.println((int)cfg.clk_divsel);
-        count = packet.write_resp(RESP_TYPE_DIV_MODE, cfg.clk_divsel);        
-      } else if (ask_opt == 'P') {
-        count = packet.write_resp(RESP_TYPE_ADC_PRE, cfg.adc_prescaler);        
-      } else if (ask_opt == 'L') {
-        count = packet.write_resp(RESP_TYPE_ADC_SAMPLEN, cfg.adc_samplen);        
-      } else if (ask_opt == 'C') {  // sample count
-        count = packet.write_resp(RESP_TYPE_SAMPLE_COUNT, packet.sample_count);        
-      } else if (ask_opt == 'B') {  /// board ID
-        count = packet.write_resp(RESP_TYPE_ID, 0xB0A4D001);
+      if (ask_opt == 'C') {
+        count = packet.write_resp(RESP_TYPE_SAMPLE_COUNT, packet.sample_count);                          
+      } else if (ask_opt == 'B') {
+        count = packet.write_resp(RESP_TYPE_ID, board_id | (accel.type_id() << 24));
+      } else if (ask_opt == 'X') {
+        count = packet.write_resp(RESP_TYPE_DROPPED_COUNT, dropped_count);
+      } else if (ask_opt == 'U') {
+        count = packet.write_resp(RESP_TYPE_T_MEAN, timing_stats.mu);
+      } else if (ask_opt == 'V') {
+        float const unbiased_sample_variance = timing_stats.M2 / (float)(timing_stats.n - 1);
+        count = packet.write_resp(RESP_TYPE_T_VARIANCE, unbiased_sample_variance);
+      }  else if (ask_opt == 'R') {
+        count = packet.write_resp(RESP_TYPE_T_MAX, timing_stats.max_T);
+      } else if (ask_opt == 'S') {
+        count = packet.write_resp(RESP_TYPE_T_MIN, timing_stats.min_T);
+      } else if (ask_opt == 'N') {
+        count = packet.write_resp(RESP_TYPE_T_N, timing_stats.n);
+      } else {
+        auto const resp = accel.get(ask_opt);
+        count = packet.write_resp(resp.type, resp.val); // can be none on fall through
       }
       if (count > 0) {
         Serial.write(packet.buffer(), count);
