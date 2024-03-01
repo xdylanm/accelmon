@@ -40,6 +40,7 @@ public:
   QueryResponse get(char key) const override;
 
 private:
+  void set_ODR_filtered();
 
 #ifdef KX134_BUS_SPI
   SparkFun_KX134_SPI accel_;

@@ -12,6 +12,25 @@ KX134::KX134(VoidFunc_T callback, int int_pin /* = 6*/)
   raw_data_buffer_ref_.count = 3;
 }
 
+// see QwDevKX13X::setOutputDataRate
+void KX134::set_ODR_filtered()
+{
+  if (cfg_.odata_rate > 15) {
+    return;
+  }
+
+  uint8_t odcntl_temp; 
+  if (accel_.readRegisterRegion(SFE_KX13X_ODCNTL, &odcntl_temp, 1) == 0) {
+    sfe_kx13x_odcntl_bitfield_t odcntl;
+    odcntl.all = odcntl_temp;
+    odcntl.bits.iir_bypass = 0; // no bypass
+    odcntl.bits.lpro = 1;       // IIR corner frequency is ODR/2
+    odcntl.bits.osa = cfg_.odata_rate;
+    odcntl_temp = odcntl.all;
+    accel_.writeRegisterByte(SFE_KX13X_ODCNTL, odcntl_temp);
+  }
+}
+
 bool KX134::init()
 {
 
@@ -59,7 +78,7 @@ bool KX134::init()
   accel_.configureInterruptPin(0x30);         // INC1 register: enabled, active HI, latched
   accel_.routeHardwareInterrupt(0x10);        // INC4 register: route DRDY signal to INT1
 
-  accel_.setOutputDataRate(cfg_.odata_rate);  // 100Hz default
+  set_ODR_filtered();                         // 100Hz default
   
   return true;
 }
@@ -75,6 +94,8 @@ void KX134::start()
   uint8_t const RES_HI_PERFORMANCE = (1 << 6);
   uint8_t const DRDY_EN = (1 << 5);
   uint8_t const GSEL_RANGE = (cfg_.g_range << 3);
+
+
   accel_.writeRegisterByte(SFE_KX13X_CNTL1, (PC1_EN | RES_HI_PERFORMANCE | DRDY_EN | GSEL_RANGE));
     
   //delay(20);  // wait 1.5/ODR = 15ms after CTL1.PC1 0->1
@@ -104,7 +125,7 @@ void KX134::set(char const key, uint32_t const val)
     if (fval != cfg_.odata_rate) {        
       cfg_.odata_rate = fval;
       stop();
-      accel_.setOutputDataRate(cfg_.odata_rate); 
+      set_ODR_filtered();
     }
   } else if (key == 'G') {
     uint8_t const fval = val & 0x03;    // choices are 0=8g, 1=16g, 2=32g, 3=64g
